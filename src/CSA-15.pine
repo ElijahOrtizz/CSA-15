@@ -1,0 +1,346 @@
+//@version=5
+indicator(title="CSA-15 Crypto Scalping Indicator", shorttitle="CSA-15", overlay=true)
+
+// ============================================================
+// CSA-15 CRYPTO SCALPING INDICATOR
+// Multi-confirmation TradingView indicator for short-term
+// crypto scalping using trend, momentum, volume, structure,
+// squeeze behavior, and optional higher-timeframe filtering.
+// ============================================================
+
+
+// ============================================================
+// INPUT SETTINGS
+// ============================================================
+
+// --- Trend Settings ---
+ema_fast_len  = input.int(9, "Fast EMA")
+ema_slow_len  = input.int(21, "Slow EMA")
+ema_trend_len = input.int(100, "Trend EMA")
+
+// --- Momentum Settings (RSI) ---
+rsi_len = input.int(14, "RSI Length")
+rsi_ob  = input.int(70, "RSI Overbought")
+rsi_os  = input.int(30, "RSI Oversold")
+
+// --- Volume Confirmation Settings ---
+vol_ma_len = input.int(20, "Volume MA Length")
+vol_mult   = input.float(1.10, "Volume Surge Multiplier", step=0.05)
+
+// --- Squeeze / Volatility Settings ---
+sq_length = input.int(20, "Squeeze Length")
+sq_mult   = input.float(2.0, "Squeeze Mult")
+
+// --- Risk Management Settings ---
+atr_len = input.int(14, "ATR Length")
+atr_sl  = input.float(1.5, "SL Multiplier")
+atr_tp  = input.float(2.2, "TP Multiplier")
+
+// --- Signal Quality / Cooldown Settings ---
+min_score = input.int(6, "Min Score (out of 8)", minval=4, maxval=8)
+cooldown  = input.int(5, "Cooldown Bars", minval=0)
+
+// --- Higher Timeframe Trend Filter ---
+use_htf_filter = input.bool(false, "Use Higher Timeframe Trend Filter")
+htf_tf         = input.timeframe("15", "HTF")
+htf_ema_len    = input.int(200, "HTF EMA Length")
+
+
+// ============================================================
+// CORE INDICATORS
+// ============================================================
+
+// --- Trend Indicators ---
+fast_ema  = ta.ema(close, ema_fast_len)
+slow_ema  = ta.ema(close, ema_slow_len)
+trend_ema = ta.ema(close, ema_trend_len)
+
+// --- Momentum Indicators ---
+rsi = ta.rsi(close, rsi_len)
+
+// --- Volatility / Risk Indicator ---
+atr = ta.atr(atr_len)
+
+// --- Volume Baseline and Surge Detection ---
+vol_ma    = ta.sma(volume, vol_ma_len)
+vol_surge = volume > vol_ma * vol_mult
+
+
+// ============================================================
+// HIGHER TIMEFRAME FILTER
+// Optional trend alignment using HTF close vs HTF EMA
+// ============================================================
+
+htf_close = request.security(syminfo.tickerid, htf_tf, close)
+htf_ema   = request.security(syminfo.tickerid, htf_tf, ta.ema(close, htf_ema_len))
+
+htf_bull = htf_close > htf_ema
+htf_bear = htf_close < htf_ema
+
+
+// ============================================================
+// SQUEEZE / MOMENTUM LOGIC
+// Bollinger Bands vs Keltner Channels + momentum slope
+// ============================================================
+
+// --- Bollinger Band Components ---
+sq_basis    = ta.sma(close, sq_length)
+sq_dev      = sq_mult * ta.stdev(close, sq_length)
+sq_upper_bb = sq_basis + sq_dev
+sq_lower_bb = sq_basis - sq_dev
+
+// --- Keltner Channel Components ---
+sq_kc_basis = ta.ema(close, sq_length)
+sq_kc_range = sq_mult * ta.atr(sq_length)
+sq_upper_kc = sq_kc_basis + sq_kc_range
+sq_lower_kc = sq_kc_basis - sq_kc_range
+
+// --- Squeeze State ---
+sqz_on  = sq_lower_bb > sq_lower_kc and sq_upper_bb < sq_upper_kc
+sqz_off = sq_lower_bb < sq_lower_kc and sq_upper_bb > sq_upper_kc
+
+// --- Momentum Estimate from Squeeze Calculation ---
+sq_delta = close - math.avg(
+    math.avg(ta.highest(high, sq_length), ta.lowest(low, sq_length)),
+    ta.sma(close, sq_length)
+)
+
+sq_val      = ta.linreg(sq_delta, sq_length, 0)
+mom_pos     = sq_val > 0
+mom_neg     = sq_val < 0
+mom_growing = sq_val > sq_val[1]
+mom_falling = sq_val < sq_val[1]
+
+
+// ============================================================
+// STOCHASTIC MOMENTUM
+// Used as an additional confirmation layer
+// ============================================================
+
+stoch_k_raw = ta.stoch(close, high, low, 14)
+stoch_k     = ta.sma(stoch_k_raw, 3)
+stoch_d     = ta.sma(stoch_k, 3)
+
+
+// ============================================================
+// HEIKIN ASHI STRUCTURE
+// Used to help confirm bullish or bearish candle behavior
+// ============================================================
+
+ha_close = (open + high + low + close) / 4
+var float ha_open = na
+ha_open := na(ha_open[1]) ? (open + close) / 2 : (ha_open[1] + ha_close[1]) / 2
+
+ha_bull = ha_close > ha_open
+ha_bear = ha_close < ha_open
+
+
+// ============================================================
+// FRESH TRIGGER LOGIC
+// Helps reduce repeated signals on every candle by requiring
+// a new crossover/crossunder style event
+// ============================================================
+
+fresh_long_trigger =
+     ta.crossover(fast_ema, slow_ema) or
+     ta.crossover(close, fast_ema) or
+     ta.crossover(stoch_k, stoch_d)
+
+fresh_short_trigger =
+     ta.crossunder(fast_ema, slow_ema) or
+     ta.crossunder(close, fast_ema) or
+     ta.crossunder(stoch_k, stoch_d)
+
+
+// ============================================================
+// LONG SIGNAL SCORE COMPONENTS
+// Each condition contributes 1 point toward the final score
+// ============================================================
+
+long_trend_alignment     = fast_ema > slow_ema
+long_price_above_trend   = close > trend_ema
+long_rsi_confirmation    = rsi > 48 and rsi < rsi_ob
+long_stoch_confirmation  = stoch_k > stoch_d and stoch_k < 85
+long_volume_confirmation = vol_surge
+long_momentum_confirm    = mom_pos and mom_growing
+long_candle_structure    = ha_bull
+long_squeeze_condition   = sqz_off or not sqz_on
+
+long_score =
+    (long_trend_alignment ? 1 : 0) +
+    (long_price_above_trend ? 1 : 0) +
+    (long_rsi_confirmation ? 1 : 0) +
+    (long_stoch_confirmation ? 1 : 0) +
+    (long_volume_confirmation ? 1 : 0) +
+    (long_momentum_confirm ? 1 : 0) +
+    (long_candle_structure ? 1 : 0) +
+    (long_squeeze_condition ? 1 : 0)
+
+
+// ============================================================
+// SHORT SIGNAL SCORE COMPONENTS
+// Each condition contributes 1 point toward the final score
+// ============================================================
+
+short_trend_alignment     = fast_ema < slow_ema
+short_price_below_trend   = close < trend_ema
+short_rsi_confirmation    = rsi < 52 and rsi > rsi_os
+short_stoch_confirmation  = stoch_k < stoch_d and stoch_k > 15
+short_volume_confirmation = vol_surge
+short_momentum_confirm    = mom_neg and mom_falling
+short_candle_structure    = ha_bear
+short_squeeze_condition   = sqz_off or not sqz_on
+
+short_score =
+    (short_trend_alignment ? 1 : 0) +
+    (short_price_below_trend ? 1 : 0) +
+    (short_rsi_confirmation ? 1 : 0) +
+    (short_stoch_confirmation ? 1 : 0) +
+    (short_volume_confirmation ? 1 : 0) +
+    (short_momentum_confirm ? 1 : 0) +
+    (short_candle_structure ? 1 : 0) +
+    (short_squeeze_condition ? 1 : 0)
+
+
+// ============================================================
+// SIGNAL COOLDOWN
+// Prevents signals from firing too frequently
+// ============================================================
+
+var int last_long_bar  = na
+var int last_short_bar = na
+
+can_long  = na(last_long_bar) or (bar_index - last_long_bar > cooldown)
+can_short = na(last_short_bar) or (bar_index - last_short_bar > cooldown)
+
+
+// ============================================================
+// FINAL ENTRY FILTERS
+// Combines score threshold, trend alignment, fresh trigger,
+// HTF filter, cooldown, and confirmed bar close
+// ============================================================
+
+base_long_ok =
+    long_score >= min_score and
+    close > trend_ema and
+    fast_ema > slow_ema and
+    fresh_long_trigger
+
+base_short_ok =
+    short_score >= min_score and
+    close < trend_ema and
+    fast_ema < slow_ema and
+    fresh_short_trigger
+
+htf_long_ok  = not use_htf_filter or htf_bull
+htf_short_ok = not use_htf_filter or htf_bear
+
+long_signal =
+    base_long_ok and
+    htf_long_ok and
+    can_long and
+    barstate.isconfirmed
+
+short_signal =
+    base_short_ok and
+    htf_short_ok and
+    can_short and
+    barstate.isconfirmed
+
+if long_signal
+    last_long_bar := bar_index
+
+if short_signal
+    last_short_bar := bar_index
+
+
+// ============================================================
+// TAKE PROFIT / STOP LOSS LEVELS
+// ATR-based projected levels displayed when signals fire
+// ============================================================
+
+long_sl  = close - atr * atr_sl
+long_tp  = close + atr * atr_tp
+short_sl = close + atr * atr_sl
+short_tp = close - atr * atr_tp
+
+
+// ============================================================
+// VISUAL PLOTS
+// ============================================================
+
+// --- EMA Trend Lines ---
+plot(fast_ema, "EMA 9", color=color.new(color.aqua, 20), linewidth=1)
+plot(slow_ema, "EMA 21", color=color.new(color.orange, 20), linewidth=1)
+plot(trend_ema, "EMA 100", color=color.new(color.gray, 35), linewidth=2)
+
+// --- Buy / Sell Labels on Chart ---
+plotshape(
+    long_signal,
+    title="BUY",
+    style=shape.labelup,
+    location=location.belowbar,
+    color=color.lime,
+    textcolor=color.black,
+    text="BUY",
+    size=size.normal
+)
+
+plotshape(
+    short_signal,
+    title="SELL",
+    style=shape.labeldown,
+    location=location.abovebar,
+    color=color.red,
+    textcolor=color.white,
+    text="SELL",
+    size=size.normal
+)
+
+// --- Background Bias ---
+bgcolor(close > trend_ema ? color.new(color.lime, 96) : color.new(color.red, 96))
+
+
+// ============================================================
+// INFO LABELS
+// Shows score and projected TP/SL when a signal appears
+// ============================================================
+
+if long_signal
+    label.new(
+         bar_index,
+         low - atr * 0.6,
+         text="Score: " + str.tostring(long_score) + "/8" +
+              "\nTP: " + str.tostring(math.round(long_tp * 100) / 100) +
+              "\nSL: " + str.tostring(math.round(long_sl * 100) / 100),
+         color=color.new(color.lime, 20),
+         textcolor=color.black,
+         style=label.style_label_up,
+         size=size.small
+    )
+
+if short_signal
+    label.new(
+         bar_index,
+         high + atr * 0.6,
+         text="Score: " + str.tostring(short_score) + "/8" +
+              "\nTP: " + str.tostring(math.round(short_tp * 100) / 100) +
+              "\nSL: " + str.tostring(math.round(short_sl * 100) / 100),
+         color=color.new(color.red, 20),
+         textcolor=color.white,
+         style=label.style_label_down,
+         size=size.small
+    )
+
+
+// ============================================================
+// ALERT CONDITIONS
+// ============================================================
+
+alertcondition(long_signal, title="BUY Signal", message="CSA-15 BUY - {{ticker}} @ {{close}}")
+alertcondition(short_signal, title="SELL Signal", message="CSA-15 SELL - {{ticker}} @ {{close}}")
+alertcondition(
+    (long_score >= 5 and can_long) or (short_score >= 5 and can_short),
+    title="Signal Building",
+    message="CSA-15 Signal Building - {{ticker}} @ {{close}}"
+)
